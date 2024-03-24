@@ -1,5 +1,180 @@
-const std = @import("std");
-const Ast = std.zig.Ast;
+/// Mutate source code within a directory tree.
+/// Recreates the directory tree in a new location, after modifying each `*.zig` file.
+/// This operation is not atomic.
+pub fn mutateTree(
+    opts: MutateTreeOptions,
+    handlers: anytype,
+) !void {
+    var source = std.ArrayList(u8).init(opts.allocator);
+    defer source.deinit();
+
+    var walker = try opts.source_dir.walk(opts.allocator);
+    defer walker.deinit();
+    while (try walker.next()) |entry| {
+        switch (entry.kind) {
+            .directory => {
+                try opts.dest_dir.makeDir(entry.path);
+            },
+
+            .file => if (std.ascii.endsWithIgnoreCase(entry.basename, ".zig")) {
+                // Read source code
+                {
+                    const f = try entry.dir.openFile(entry.basename, .{});
+                    defer f.close();
+
+                    const size = if (f.stat()) |st| st.size else |_| 0;
+                    if (size > opts.max_source_file_size) {
+                        return error.StreamTooLong;
+                    }
+
+                    source.clearRetainingCapacity();
+                    const size_usize: usize = @intCast(size); // For 32-bit systems
+                    try source.ensureTotalCapacity(size_usize + 1); // + 1 for terminator
+                    try f.reader().readAllArrayList(&source, opts.max_source_file_size);
+                }
+
+                // Terminate source
+                try source.append(0);
+                const source_slice = source.items[0 .. source.items.len - 1 :0];
+
+                // Mutate code
+                const output = try mutate(opts.allocator, source_slice, handlers);
+                defer opts.allocator.free(output);
+
+                // Write mutated code
+                try opts.dest_dir.writeFile2(.{
+                    .sub_path = entry.path,
+                    .data = output,
+                });
+            } else {
+                // Not a Zig file; just copy it
+                try entry.dir.copyFile(
+                    entry.basename,
+                    opts.dest_dir,
+                    entry.path,
+                    .{},
+                );
+            },
+
+            // TODO: symlinks
+
+            else => switch (opts.unhandled_file_behavior) {
+                .skip => {},
+                .err => return error.InvalidFileKind, // block device, unix socket, etc
+            },
+        }
+    }
+}
+
+pub const MutateTreeOptions = struct {
+    /// Allocator used during the operation.
+    /// All allocations will be freed before the function returns.
+    allocator: std.mem.Allocator,
+
+    /// The source directory. Must be opened with `.iterate = true`.
+    source_dir: std.fs.Dir,
+    /// The destination directory.
+    dest_dir: std.fs.Dir,
+
+    /// The maximum file size for Zig source files within the source directory. Default 8MiB.
+    max_source_file_size: u32 = 8 * 1024 * 1024,
+
+    /// How to handle unusual kinds of files (block devices, unix sockets, etc.)
+    /// Currently, symbolic links are included in this, but it would be good to support those.
+    unhandled_file_behavior: enum { skip, err } = .err,
+};
+
+test mutateTree {
+    var dest_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer dest_dir.cleanup();
+
+    var test_dir = try std.fs.cwd().openDir("test-tree", .{});
+    defer test_dir.close();
+
+    {
+        var source_dir = try test_dir.openDir("src", .{ .iterate = true });
+        defer source_dir.close();
+
+        try mutateTree(.{
+            .allocator = std.testing.allocator,
+            .source_dir = source_dir,
+            .dest_dir = dest_dir.dir,
+        }, struct {
+            pub fn function(ctx: MutationContext(.function)) !void {
+                try ctx.inject("@import(\"std\").debug.print(\"hi!\", .{{}});", .{});
+            }
+        });
+    }
+
+    var expected_dir = try test_dir.openDir("expected", .{ .iterate = true });
+    defer expected_dir.close();
+
+    try expectEqualTrees(expected_dir, dest_dir.dir);
+}
+
+fn expectEqualTrees(expected_dir: std.fs.Dir, actual_dir: std.fs.Dir) !void {
+    { // Check everything in expected_dir is in actual_dir, and has same content
+        var it = try expected_dir.walk(std.testing.allocator);
+        defer it.deinit();
+        while (try it.next()) |entry| {
+            const stat = actual_dir.statFile(entry.path) catch {
+                std.debug.print("Expected file '{'}' but it does not exist in actual directory\n", .{
+                    std.zig.fmtEscapes(entry.path),
+                });
+                return error.TestExpectedEqual;
+            };
+            if (entry.kind != stat.kind) {
+                std.debug.print("'{'}' is of incorrect type. Expected {s}, found {s}\n", .{
+                    std.zig.fmtEscapes(entry.path),
+                    @tagName(entry.kind),
+                    @tagName(stat.kind),
+                });
+                return error.TestExpectedEqual;
+            }
+
+            switch (entry.kind) {
+                .directory => {},
+                .file => {
+                    const expected_file = try entry.dir.openFile(entry.basename, .{});
+                    defer expected_file.close();
+                    const actual_file = try actual_dir.openFile(entry.path, .{});
+                    defer actual_file.close();
+
+                    // Compare file content
+                    var expected_buf: [1024]u8 = undefined;
+                    var actual_buf: [1024]u8 = undefined;
+                    while (true) {
+                        const expected_len = try expected_file.read(&expected_buf);
+                        const actual_len = try actual_file.read(&actual_buf);
+                        try std.testing.expectEqualStrings(
+                            expected_buf[0..expected_len],
+                            actual_buf[0..actual_len],
+                        );
+
+                        if (expected_len == 0 or actual_len == 0) {
+                            break;
+                        }
+                    }
+                },
+                else => return error.UnexpectedFileType,
+            }
+        }
+    }
+
+    { // Check everything in actual_dir is in expected_dir
+        var it = try actual_dir.walk(std.testing.allocator);
+        defer it.deinit();
+        while (try it.next()) |entry| {
+            const stat = expected_dir.statFile(entry.path) catch {
+                std.debug.print("Unexpected extra file '{'}'\n", .{
+                    std.zig.fmtEscapes(entry.path),
+                });
+                return error.TestExpectedEqual;
+            };
+            try std.testing.expectEqual(entry.kind, stat.kind);
+        }
+    }
+}
 
 pub const Event = union(enum) {
     function: Function, // Emitted at the start of every function
@@ -13,7 +188,7 @@ pub const Event = union(enum) {
 /// Mutate the source code with the given handlers.
 /// Returns modified source code, owned by the caller.
 ///
-/// `handlers` is a struct with methods for each `Event`.
+/// `handlers` is a type with functions, or value with methods, for each `Event`.
 /// If an event is missing, it will be ignored.
 ///
 /// Event handlers must follow the signature:
@@ -208,3 +383,6 @@ test mutate {
         try std.testing.expectEqualStrings(exp, out);
     }
 }
+
+const std = @import("std");
+const Ast = std.zig.Ast;
