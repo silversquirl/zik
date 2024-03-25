@@ -150,7 +150,11 @@ pub fn main(comptime modules: anytype, comptime handlers: anytype) fn () anyerro
 
             // Run the build
             var proc = std.ChildProcess.init(cmd.items, arena.allocator());
-            proc.cwd_dir = dest_dir; // TODO: adjust for relative path
+            // FIXME: Really, we want to run with the current PWD, but still on the mutated source files.
+            //        There's no real nice way to do this, just gotta manually remap all the paths.
+            //        I *really* cannot be fucked with that right now, so any output files will be in `zig-cache/tmp/zik/src`.
+            // TODO: adjust based on relative path between PWD and `source_dir`.
+            proc.cwd_dir = dest_dir;
             try proc.spawn();
 
             switch (try proc.wait()) {
