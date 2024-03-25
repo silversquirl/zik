@@ -2,7 +2,7 @@
 
 A slightly cursed library for source-level static instrumentation in Zig.
 
-This repository also includes a simple function-level profiler that outputs to the [callgrind format](https://valgrind.org/docs/manual/cl-format.html), which is readable by [KCacheGrind](https://kcachegrind.sourceforge.net/html/Home.html).
+This repository also includes a simple function-level profiler that outputs to the [callgrind format](https://valgrind.org/docs/manual/cl-format.html), which is readable by [KCacheGrind](https://kcachegrind.github.io/html/Home.html).
 
 ## Using the profiler
 
