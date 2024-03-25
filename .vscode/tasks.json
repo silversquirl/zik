@@ -11,6 +11,13 @@
 			"type": "shell",
 			"command": "zig build test",
 			"problemMatcher": [],
+			"group": { "kind": "build" }
+		},
+		{
+			"label": "Build zikprof",
+			"type": "shell",
+			"command": "zig build zikprof",
+			"problemMatcher": [],
 			"group": {
 				"kind": "build",
 				"isDefault": true

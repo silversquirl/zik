@@ -1,5 +1,8 @@
 pub fn build(b: *std.Build) void {
-    _ = b.addModule("zik", .{
+    const target = b.standardTargetOptions(.{});
+    const optimize = b.standardOptimizeOption(.{});
+
+    const mod = b.addModule("zik", .{
         .root_source_file = .{ .path = "src/root.zig" },
     });
 
@@ -12,6 +15,15 @@ pub fn build(b: *std.Build) void {
     } else {
         test_step.dependOn(&b.addRunArtifact(tests).step);
     }
+
+    const prof = b.addExecutable(.{
+        .name = "zikprof",
+        .root_source_file = .{ .path = "tools/zikprof.zig" },
+        .target = target,
+        .optimize = optimize,
+    });
+    prof.root_module.addImport("zik", mod);
+    b.step("zikprof", "Build the zikprof profiler").dependOn(&b.addInstallArtifact(prof, .{}).step);
 }
 
 const std = @import("std");

@@ -8,60 +8,92 @@ pub fn mutateTree(
     var source = std.ArrayList(u8).init(opts.allocator);
     defer source.deinit();
 
-    var walker = try opts.source_dir.walk(opts.allocator);
-    defer walker.deinit();
-    while (try walker.next()) |entry| {
-        switch (entry.kind) {
-            .directory => {
-                try opts.dest_dir.makeDir(entry.path);
-            },
+    var stack = std.ArrayList(struct {
+        src: std.fs.Dir,
+        dest: std.fs.Dir,
+    }).init(opts.allocator);
+    defer stack.deinit();
 
-            .file => if (std.ascii.endsWithIgnoreCase(entry.basename, ".zig")) {
-                // Read source code
-                {
-                    const f = try entry.dir.openFile(entry.basename, .{});
-                    defer f.close();
+    {
+        try stack.append(.{
+            // Reopen src dir, but iterable
+            .src = try opts.source_dir.openDir(".", .{ .iterate = true }),
+            // Reopen dest dir too, so we can close it
+            .dest = try opts.dest_dir.openDir(".", .{}),
+        });
+    }
 
-                    const size = if (f.stat()) |st| st.size else |_| 0;
-                    if (size > opts.max_source_file_size) {
-                        return error.StreamTooLong;
+    while (stack.popOrNull()) |item| {
+        var src = item.src;
+        var dest = item.dest;
+        defer {
+            src.close();
+            dest.close();
+        }
+
+        var it = src.iterateAssumeFirstIteration();
+        while (try it.next()) |entry| {
+            switch (entry.kind) {
+                .directory => {
+                    const skip_paths = std.ComptimeStringMap(void, .{
+                        .{".git"},
+                        .{"zig-cache"},
+                        .{"zig-out"},
+                    });
+                    const skip = skip_paths.get(entry.name) != null;
+
+                    if (!skip) {
+                        const src_child = try it.dir.openDir(entry.name, .{ .iterate = true });
+                        const dest_child = try dest.makeOpenPath(entry.name, .{});
+                        try stack.append(.{
+                            .src = src_child,
+                            .dest = dest_child,
+                        });
+                    }
+                },
+
+                .file => if (std.ascii.endsWithIgnoreCase(entry.name, ".zig")) {
+                    // Read source code
+                    {
+                        const f = try it.dir.openFile(entry.name, .{});
+                        defer f.close();
+
+                        const size = if (f.stat()) |st| st.size else |_| 0;
+                        if (size > opts.max_source_file_size) {
+                            return error.StreamTooLong;
+                        }
+
+                        source.clearRetainingCapacity();
+                        const size_usize: usize = @intCast(size); // For 32-bit systems
+                        try source.ensureTotalCapacity(size_usize + 1); // + 1 for terminator
+                        try f.reader().readAllArrayList(&source, opts.max_source_file_size);
                     }
 
-                    source.clearRetainingCapacity();
-                    const size_usize: usize = @intCast(size); // For 32-bit systems
-                    try source.ensureTotalCapacity(size_usize + 1); // + 1 for terminator
-                    try f.reader().readAllArrayList(&source, opts.max_source_file_size);
-                }
+                    // Terminate source
+                    try source.append(0);
+                    const source_slice = source.items[0 .. source.items.len - 1 :0];
 
-                // Terminate source
-                try source.append(0);
-                const source_slice = source.items[0 .. source.items.len - 1 :0];
+                    // Mutate code
+                    const output = try mutate(opts.allocator, source_slice, handlers);
+                    defer opts.allocator.free(output);
 
-                // Mutate code
-                const output = try mutate(opts.allocator, source_slice, handlers);
-                defer opts.allocator.free(output);
+                    // Write mutated code
+                    try dest.writeFile2(.{
+                        .sub_path = entry.name,
+                        .data = output,
+                    });
+                } else {
+                    // Not a Zig file; just copy it
+                    try it.dir.copyFile(entry.name, dest, entry.name, .{});
+                },
 
-                // Write mutated code
-                try opts.dest_dir.writeFile2(.{
-                    .sub_path = entry.path,
-                    .data = output,
-                });
-            } else {
-                // Not a Zig file; just copy it
-                try entry.dir.copyFile(
-                    entry.basename,
-                    opts.dest_dir,
-                    entry.path,
-                    .{},
-                );
-            },
+                // TODO: symlinks
 
-            // TODO: symlinks
-
-            else => switch (opts.unhandled_file_behavior) {
-                .skip => {},
-                .err => return error.InvalidFileKind, // block device, unix socket, etc
-            },
+                else => switch (opts.unhandled_file_behavior) {
+                    .skip => {},
+                    .err => return error.InvalidFileKind, // block device, unix socket, etc
+                },
+            }
         }
     }
 }
@@ -71,7 +103,7 @@ pub const MutateTreeOptions = struct {
     /// All allocations will be freed before the function returns.
     allocator: std.mem.Allocator,
 
-    /// The source directory. Must be opened with `.iterate = true`.
+    /// The source directory.
     source_dir: std.fs.Dir,
     /// The destination directory.
     dest_dir: std.fs.Dir,
@@ -92,7 +124,7 @@ test mutateTree {
     defer test_dir.close();
 
     {
-        var source_dir = try test_dir.openDir("src", .{ .iterate = true });
+        var source_dir = try test_dir.openDir("src", .{});
         defer source_dir.close();
 
         try mutateTree(.{
@@ -383,6 +415,12 @@ test mutate {
         try std.testing.expectEqualStrings(exp, out);
     }
 }
+
+/// A namespacing string that is very unlikely to be used in normal Zig code.
+/// Usable within string literals. Use `@""` syntax if you need an identifier.
+pub const namespace = "🅉🄸🄺";
+
+pub const wrapper = @import("wrapper.zig");
 
 const std = @import("std");
 const Ast = std.zig.Ast;
